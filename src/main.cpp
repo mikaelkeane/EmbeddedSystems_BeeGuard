@@ -3,26 +3,37 @@
 #include <Keypad.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <UniversalTelegramBot.h>
 #include <Preferences.h>
 #include <LiquidCrystal_I2C.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 // ---------- WiFi (Wokwi simulation with internet access) ----------
 const char* ssid = "Wokwi-GUEST";
 const char* password = "";
 
 // ---------- Telegram ----------
-#define BOT_TOKEN "REPLACE_WITH_YOUR_TELEGRAM_BOT_TOKEN"
+#define BOT_TOKEN "8946478461:AAGHQPUJXJk2QLaMwsL6mmtZgHRpYK9VpVw"
 #define LCD_SDA 2
 #define LCD_SCL 0
 #define LCD_SLEEP_TIMEOUT 15000UL
 WiFiClientSecure secured_client;
 UniversalTelegramBot bot(BOT_TOKEN, secured_client);
+WiFiClientSecure telegramPollClient;
+UniversalTelegramBot telegramPollBot(BOT_TOKEN, telegramPollClient);
 Preferences preferences;
 String telegramChatId;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 unsigned long lastLcdActivity = 0;
 bool lcdSleeping = false;
+const unsigned long OTP_LIFETIME = 300000UL;
+String activeOTP;
+unsigned long otpExpiresAt = 0;
+SemaphoreHandle_t otpMutex = nullptr;
 
 // ---------- RFID ----------
 #define RST_PIN 22
@@ -81,6 +92,8 @@ void registerFailedAttempt();
 void triggerAlarm(String reason, bool notifyTelegram = true);
 void sendTelegramAlert(String message);
 void checkTelegramConnection();
+void telegramPollingTask(void* parameter);
+bool consumeOTP(const String& candidate);
 void requestReset(ResetRequest resetRequest);
 void handleResetKey(char key);
 void completeReset();
@@ -110,8 +123,17 @@ void setup() {
 
   connectWiFi();
   secured_client.setInsecure(); // Simulation only
+  telegramPollClient.setInsecure(); // Simulation only
   checkTelegramConnection();
   lcdShow("Enter", "RFID or PIN");
+
+  otpMutex = xSemaphoreCreateMutex();
+  if (otpMutex != nullptr &&
+      xTaskCreatePinnedToCore(telegramPollingTask, "TelegramPoll", 8192, nullptr, 1, nullptr, 0) == pdPASS) {
+    Serial.println("Telegram OTP polling started.");
+  } else {
+    Serial.println("Telegram OTP polling unavailable.");
+  }
 }
 
 void loop() {
@@ -434,7 +456,11 @@ void checkKeypad() {
   } else if (key == 'B') {
     requestReset(RESET_RFID);
   } else if (key == '#') { // Confirm PIN
-    if (enteredPIN == validPIN) {
+    if (consumeOTP(enteredPIN)) {
+      Serial.println("One-time Telegram code accepted.");
+      lcdShow("OTP accepted", "Opening door...");
+      openDoor();
+    } else if (enteredPIN == validPIN) {
       lcdShow("PIN correct", "Opening door...");
       openDoor();
     } else {
@@ -517,7 +543,7 @@ void triggerAlarm(String reason, bool notifyTelegram) {
   Serial.println("ALARM: " + reason);
   lcdShow("!!! ALARM !!!", "Access denied");
   if (notifyTelegram) {
-    sendTelegramAlert("[BeeGuard ALERT]\n" + reason + "\n(Camera snapshot requires physical camera hardware)");
+    sendTelegramAlert("[BeeGuard ALERT]\n" + reason + "\n(Camera snapshot here)");
   }
   digitalWrite(LED_ALARM_PIN, HIGH); // Red LED on
   digitalWrite(BUZZER_PIN, HIGH);
@@ -547,19 +573,134 @@ void checkTelegramConnection() {
     return;
   }
 
-  if (telegramChatId.length() == 0) {
-    Serial.println("Telegram failed: Chat ID is empty.");
+  HTTPClient http;
+  http.setTimeout(10000);
+  String url = "https://api.telegram.org/bot" + token + "/getMe";
+  if (!http.begin(secured_client, url)) {
+    Serial.println("Telegram failed: could not initialize HTTPS request.");
     return;
   }
 
-  if (bot.getMe()) {
-    Serial.println("Telegram connected to bot @" + bot.userName);
-    if (bot.sendMessage(telegramChatId, "BeeGuard online. System ready.", "")) {
-      Serial.println("Telegram startup message sent.");
-    } else {
-      Serial.println("Token is valid, but Telegram rejected the Chat ID.");
-    }
-  } else {
-    Serial.println("Telegram failed: token rejected or HTTPS connection failed.");
+  int status = http.GET();
+  String body = http.getString();
+  http.end();
+
+  if (status < 0) {
+    Serial.println("Telegram HTTPS request failed: " + HTTPClient::errorToString(status));
+    return;
   }
+
+  DynamicJsonDocument response(1024);
+  DeserializationError parseError = deserializeJson(response, body);
+  if (parseError) {
+    Serial.printf("Telegram returned an unreadable response (HTTP %d).\n", status);
+    return;
+  }
+
+  if (status != HTTP_CODE_OK || !(response["ok"] | false)) {
+    Serial.printf("Telegram API rejected getMe (HTTP %d): %s\n", status,
+                  response["description"] | "No error description.");
+    return;
+  }
+
+  bot.userName = response["result"]["username"].as<String>();
+  Serial.println("Telegram connected to bot @" + bot.userName);
+  if (telegramChatId.length() == 0) {
+    Serial.println("Telegram bot is valid, but Chat ID is empty; startup message skipped.");
+    return;
+  }
+
+  if (bot.sendMessage(telegramChatId,
+                      "BeeGuard online. System ready. Send /otp to request a one-time door code.", "")) {
+    Serial.println("Telegram startup message sent.");
+  } else {
+    Serial.println("Telegram bot is valid, but startup message failed; check the Chat ID and bot conversation.");
+  }
+}
+
+void telegramPollingTask(void* parameter) {
+  (void)parameter;
+  long lastUpdateId = 0;
+
+  while (true) {
+    if (WiFi.status() != WL_CONNECTED || telegramChatId.length() == 0) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot";
+    url += BOT_TOKEN;
+    url += "/getUpdates?offset=";
+    url += String(lastUpdateId + 1);
+    url += "&limit=10&timeout=5";
+    http.setTimeout(12000);
+
+    if (http.begin(telegramPollClient, url)) {
+      int status = http.GET();
+      if (status == HTTP_CODE_OK) {
+        String body = http.getString();
+        DynamicJsonDocument response(4096);
+        if (deserializeJson(response, body) == DeserializationError::Ok) {
+          JsonArray updates = response["result"].as<JsonArray>();
+          for (JsonObject update : updates) {
+            long updateId = update["update_id"] | 0L;
+            if (updateId > lastUpdateId) lastUpdateId = updateId;
+
+            JsonObject message = update["message"];
+            if (message.isNull()) continue;
+
+            String chatId = message["chat"]["id"].as<String>();
+            String text = message["text"] | "";
+            if (chatId != telegramChatId ||
+                (text != "/otp" && !text.startsWith("/otp@"))) continue;
+
+            uint32_t code = esp_random() % 1000000UL;
+            String generatedOTP = String(code);
+            while (generatedOTP.length() < 6) generatedOTP = "0" + generatedOTP;
+
+            if (xSemaphoreTake(otpMutex, portMAX_DELAY) == pdTRUE) {
+              activeOTP = generatedOTP;
+              otpExpiresAt = millis() + OTP_LIFETIME;
+              xSemaphoreGive(otpMutex);
+            }
+
+            telegramPollBot.sendMessage(
+                telegramChatId,
+                "Your one-time door code is " + generatedOTP +
+                    ". Enter it on the keypad and press # within 5 minutes. Requesting another code replaces this one.",
+                "");
+          }
+        }
+      }
+      http.end();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+bool consumeOTP(const String& candidate) {
+  if (otpMutex == nullptr || xSemaphoreTake(otpMutex, portMAX_DELAY) != pdTRUE) return false;
+
+  if (activeOTP.length() == 0) {
+    xSemaphoreGive(otpMutex);
+    return false;
+  }
+
+  if ((long)(millis() - otpExpiresAt) >= 0) {
+    activeOTP = "";
+    xSemaphoreGive(otpMutex);
+    return false;
+  }
+
+  if (candidate != activeOTP) {
+    xSemaphoreGive(otpMutex);
+    return false;
+  }
+
+  activeOTP = "";
+  otpExpiresAt = 0;
+  xSemaphoreGive(otpMutex);
+  return true;
 }
